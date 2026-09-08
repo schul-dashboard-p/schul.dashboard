@@ -22,7 +22,7 @@ const DEFAULTS=[
 {name:'myLKUF',short:'LKUF',description:'OÖ. Lehrer-Kranken- und Unfallfürsorge',url:'https://www.lkuf.at/'}];
 const cfg=window.APP_CONFIG||{}; const configured=cfg.SUPABASE_URL&&!cfg.SUPABASE_URL.includes('DEIN-')&&cfg.SUPABASE_PUBLISHABLE_KEY&&!cfg.SUPABASE_PUBLISHABLE_KEY.includes('DEIN_');
 const sb=configured?supabase.createClient(cfg.SUPABASE_URL,cfg.SUPABASE_PUBLISHABLE_KEY):null;
-let user=null,apps=[]; const $=id=>document.getElementById(id);
+let user=null,apps=[]; let defaultsInitPromise=null, loadAppsPromise=null, activeUserId=null; const $=id=>document.getElementById(id);
 function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function setSync(t){$('syncText').textContent=t}
 function iconHtml(app){const fallback=esc(app.short||app.name.slice(0,2).toUpperCase());let u;try{u=new URL(app.url)}catch{return `<span class=\"fallback-short\">${fallback}</span>`}const direct=`${u.origin}/favicon.ico`;const google=`https://www.google.com/s2/favicons?domain_url=${encodeURIComponent(u.href)}&sz=64`;return `<img src=\"${esc(direct)}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\" data-fallback=\"${fallback}\" data-google=\"${esc(google)}\">`}
@@ -31,8 +31,42 @@ let sortable=null,suppressClickUntil=0;
 function render(){const f=$('search').value.trim().toLowerCase();$('grid').innerHTML='';apps.filter(a=>(a.name+' '+a.description).toLowerCase().includes(f)).forEach(app=>{const c=document.createElement('article');c.className='card';c.dataset.appId=app.id;c.innerHTML=`<button class="drag-handle" type="button" aria-label="Kachel verschieben" title="Verschieben">↕</button><div><div class="icon">${iconHtml(app)}</div><h3>${esc(app.name)}</h3><p>${esc(app.description||'')}</p></div><div class="actions"><button class="mini edit">Bearbeiten</button><button class="mini del">Entfernen</button><button class="mini open">Öffnen ↗</button></div>`;c.onclick=()=>{if(Date.now()<suppressClickUntil)return;window.open(app.url,'_blank','noopener')};c.querySelector('.drag-handle').onclick=e=>e.stopPropagation();c.querySelector('.open').onclick=e=>{e.stopPropagation();window.open(app.url,'_blank','noopener')};c.querySelector('.edit').onclick=e=>{e.stopPropagation();openEdit(app)};c.querySelector('.del').onclick=e=>{e.stopPropagation();removeApp(app)};$('grid').appendChild(c);wireIconFallback(c)});const a=document.createElement('article');a.className='card add';a.innerHTML='<div class="icon">+</div><div><h3>Anwendung hinzufügen</h3><p>Wird automatisch synchronisiert</p></div>';a.onclick=openAdd;$('grid').appendChild(a);initSortable()}
 function initSortable(){if(sortable){sortable.destroy();sortable=null}if($('search').value.trim()||typeof Sortable==='undefined')return;const isTouch=window.matchMedia('(pointer: coarse)').matches||('ontouchstart' in window);const opts={draggable:'.card[data-app-id]',animation:160,delay:isTouch?80:0,delayOnTouchOnly:true,touchStartThreshold:6,fallbackTolerance:5,forceFallback:isTouch,fallbackOnBody:isTouch,filter:'input,a,.actions,.add',preventOnFilter:false,ghostClass:'sortable-ghost',chosenClass:'sortable-chosen',dragClass:'sortable-drag',onStart:()=>{suppressClickUntil=Date.now()+1200;document.body.classList.add('dragging-active');setSync('Kachel verschieben …')},onEnd:()=>{suppressClickUntil=Date.now()+700;document.body.classList.remove('dragging-active');persistTileOrder()}};if(isTouch)opts.handle='.drag-handle';sortable=Sortable.create($('grid'),opts)}
 async function persistTileOrder(){const ids=[...$('grid').querySelectorAll('.card[data-app-id]')].map(c=>c.dataset.appId);const byId=new Map(apps.map(a=>[a.id,a]));const ordered=ids.map(id=>byId.get(id)).filter(Boolean);apps=ordered.map((a,i)=>({...a,sort_order:i}));setSync('Reihenfolge wird gespeichert …');try{const results=await Promise.all(apps.map((a,i)=>sb.from('dashboard_apps').update({sort_order:i,updated_at:new Date().toISOString()}).eq('id',a.id)));const failed=results.find(r=>r.error);if(failed)throw failed.error;setSync('Reihenfolge gespeichert ✓')}catch(e){setSync('Speichern fehlgeschlagen: '+e.message);await loadApps()}}
-async function ensureDefaults(){const {count,error}=await sb.from('dashboard_apps').select('*',{count:'exact',head:true});if(error)throw error;if(count===0){const rows=DEFAULTS.map((a,i)=>({...a,user_id:user.id,sort_order:i}));const {error:e}=await sb.from('dashboard_apps').insert(rows);if(e)throw e}}
-async function loadApps(){if(!user)return;setSync('Synchronisiere …');try{await ensureDefaults();const {data,error}=await sb.from('dashboard_apps').select('*').order('sort_order').order('created_at');if(error)throw error;apps=data||[];render();setSync('Synchronisiert ✓')}catch(e){setSync('Synchronisation fehlgeschlagen: '+e.message)}}
+async function ensureDefaults(){
+  if(!user)return;
+  const uid=user.id;
+  if(defaultsInitPromise)return defaultsInitPromise;
+  defaultsInitPromise=(async()=>{
+    const {data,error}=await sb.from('dashboard_apps').select('id,url,name').order('created_at');
+    if(error)throw error;
+    if(uid!==user?.id)return;
+    const existing=data||[];
+    if(existing.length===0){
+      const rows=DEFAULTS.map((a,i)=>({...a,user_id:uid,sort_order:i}));
+      const {error:e}=await sb.from('dashboard_apps').insert(rows);
+      if(e)throw e;
+    }
+  })();
+  try{return await defaultsInitPromise}
+  finally{defaultsInitPromise=null}
+}
+async function loadApps(){
+  if(!user)return;
+  const uid=user.id;
+  if(loadAppsPromise)return loadAppsPromise;
+  loadAppsPromise=(async()=>{
+    setSync('Synchronisiere …');
+    try{
+      await ensureDefaults();
+      if(uid!==user?.id)return;
+      const {data,error}=await sb.from('dashboard_apps').select('*').order('sort_order').order('created_at');
+      if(error)throw error;
+      if(uid!==user?.id)return;
+      apps=data||[];render();setSync('Synchronisiert ✓');
+    }catch(e){setSync('Synchronisation fehlgeschlagen: '+e.message)}
+  })();
+  try{return await loadAppsPromise}
+  finally{loadAppsPromise=null}
+}
 function openAdd(){$('editId').value='';$('modalTitle').textContent='Anwendung hinzufügen';$('appForm').reset();$('appDialog').showModal()}
 function openEdit(a){$('editId').value=a.id;$('modalTitle').textContent='Anwendung bearbeiten';$('name').value=a.name;$('url').value=a.url;$('description').value=a.description||'';$('short').value=a.short||'';$('appDialog').showModal()}
 async function removeApp(a){if(!confirm(`„${a.name}“ entfernen?`))return;const {error}=await sb.from('dashboard_apps').delete().eq('id',a.id);if(error)alert(error.message);else loadApps()}
@@ -41,6 +75,15 @@ $('cancelBtn').onclick=()=>$('appDialog').close();$('search').oninput=render;$('
 $('loginBtn').onclick=async()=>{if(!configured)return showConfigError();$('authMsg').textContent='';const {error}=await sb.auth.signInWithPassword({email:$('authEmail').value.trim(),password:$('authPassword').value});if(error)$('authMsg').textContent=error.message};
 $('logoutBtn').onclick=()=>sb&&sb.auth.signOut();
 function showConfigError(){$('authMsg').textContent='Supabase ist noch nicht eingerichtet. Öffne README.html und trage danach URL und Publishable/Anon-Key in config.js ein.'}
-async function applySession(session){user=session?.user||null;$('authOverlay').classList.toggle('hidden',!!user);$('userLabel').textContent=user?user.email:'Nicht angemeldet';$('userStatus').textContent=user?'Cloud-Synchronisation aktiv':configured?'Bitte anmelden':'Supabase noch nicht konfiguriert';if(user)loadApps();else{apps=[];render()}}
+async function applySession(session){
+  const nextUser=session?.user||null;
+  const nextId=nextUser?.id||null;
+  if(nextId!==activeUserId){defaultsInitPromise=null;loadAppsPromise=null;activeUserId=nextId}
+  user=nextUser;
+  $('authOverlay').classList.toggle('hidden',!!user);
+  $('userLabel').textContent=user?user.email:'Nicht angemeldet';
+  $('userStatus').textContent=user?'Cloud-Synchronisation aktiv':configured?'Bitte anmelden':'Supabase noch nicht konfiguriert';
+  if(user)await loadApps();else{apps=[];render()}
+}
 (async()=>{if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js');if(!configured){showConfigError();$('userStatus').textContent='Supabase noch nicht konfiguriert';return}const {data}=await sb.auth.getSession();applySession(data.session);sb.auth.onAuthStateChange((_event,session)=>applySession(session));})();
 </script></body></html>
